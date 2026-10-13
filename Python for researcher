@@ -1,0 +1,602 @@
+# ============================================
+# PROGRAM ANALISIS DAN KOREKSI OTOMATIS PAPER
+# Dengan Deteksi AI, Similarity, dan Grammar
+# ============================================
+
+# Install library yang diperlukan
+!pip install PyPDF2
+!pip install python-docx
+!pip install docx2txt
+!pip install textblob
+!pip install sentence-transformers
+!pip install language-tool-python
+!pip install pyspellchecker
+!pip install deep-translator
+!pip install pdfplumber
+!pip install spacy
+!python -m spacy download en_core_web_sm
+!python -m spacy download pt_core_news_sm
+
+# Import library
+import PyPDF2
+import docx
+import os
+import re
+import nltk
+import spacy
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Tuple
+from textblob import TextBlob
+from spellchecker import SpellChecker
+import language_tool_python
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer, util
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import warnings
+warnings.filterwarnings('ignore')
+from collections import Counter
+import string
+from deep_translator import GoogleTranslator
+import nltk
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('wordnet')
+
+# ============================================
+# 1. FUNGSI UNTUK MEMBACA FILE
+# ============================================
+
+from google.colab import files
+import pdfplumber
+import docx2txt
+
+def upload_file():
+    """
+    Upload file PDF atau DOC
+    """
+    print("📤 Silakan upload file paper Anda (PDF atau DOC)")
+    uploaded = files.upload()
+
+    for filename in uploaded.keys():
+        print(f"✅ File berhasil diupload: {filename}")
+        return filename
+    return None
+
+def read_pdf(file_path):
+    """
+    Membaca file PDF dan mengekstrak teks
+    """
+    try:
+        text = ""
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        print(f"❌ Error membaca PDF: {e}")
+        return None
+
+def read_docx(file_path):
+    """
+    Membaca file DOCX dan mengekstrak teks
+    """
+    try:
+        text = docx2txt.process(file_path)
+        return text
+    except Exception as e:
+        print(f"❌ Error membaca DOCX: {e}")
+        return None
+
+def read_file(file_path):
+    """
+    Membaca file berdasarkan ekstensi
+    """
+    if file_path.endswith('.pdf'):
+        return read_pdf(file_path)
+    elif file_path.endswith('.docx') or file_path.endswith('.doc'):
+        return read_docx(file_path)
+    else:
+        print("❌ Format file tidak didukung. Gunakan PDF atau DOCX")
+        return None
+
+# ============================================
+# 2. FUNGSI DETEKSI DAN KOREKSI KESALAHAN
+# ============================================
+
+class TextCorrector:
+    def __init__(self):
+        """
+        Inisialisasi berbagai tools untuk koreksi teks
+        """
+        print("🔧 Menginisialisasi tools koreksi...")
+        self.spell_checker_en = SpellChecker(language='en')
+        self.spell_checker_id = SpellChecker(language='id')
+        self.lt = language_tool_python.LanguageTool('id-ID')
+        self.lt_en = language_tool_python.LanguageTool('en-US')
+        self.nlp_en = spacy.load('en_core_web_sm')
+        self.nlp_id = spacy.load('pt_core_news_sm')
+        self.translator = GoogleTranslator(source='auto', target='en') # Initialize with deep_translator
+
+        print("✅ Tools koreksi siap digunakan")
+
+    def check_typos(self, text, lang='id'):
+        """
+        Memeriksa dan memperbaiki typo
+        """
+        words = text.split()
+        corrected_words = []
+        corrections = []
+
+        spell_checker = self.spell_checker_id if lang == 'id' else self.spell_checker_en
+
+        for word in words:
+            # Hapus tanda baca untuk pengecekan
+            clean_word = word.strip(string.punctuation)
+
+            if clean_word and len(clean_word) > 2:
+                if clean_word.lower() not in spell_checker:
+                    candidates = spell_checker.candidates(clean_word)
+                    if candidates:
+                        corrected = list(candidates)[0]
+                        if corrected != clean_word:
+                            corrections.append({
+                                'original': clean_word,
+                                'corrected': corrected,
+                                'position': words.index(word)
+                            })
+                            word = word.replace(clean_word, corrected)
+
+            corrected_words.append(word)
+
+        return ' '.join(corrected_words), corrections
+
+    def check_grammar(self, text, lang='id'):
+        """
+        Memeriksa dan memperbaiki grammar
+        """
+        tool = self.lt if lang == 'id' else self.lt_en
+        matches = tool.check(text)
+        corrections = []
+
+        # Terapkan koreksi
+        corrected_text = text
+        for match in matches[:20]:  # Batasi untuk menghindari terlalu banyak perubahan
+            if match.replacements:
+                correction = {
+                    'issue': match.message,
+                    'suggestion': match.replacements[0],
+                    'context': match.context,
+                    'offset': match.offset,
+                    'length': match.errorLength
+                }
+                corrections.append(correction)
+
+                # Lakukan koreksi
+                start = match.offset
+                end = match.offset + match.errorLength
+                if start < len(corrected_text) and end <= len(corrected_text):
+                    corrected_text = corrected_text[:start] + match.replacements[0] + corrected_text[end:]
+
+        return corrected_text, corrections
+
+    def check_formatting(self, text):
+        """
+        Memeriksa format penulisan (italic, bold, dll)
+        """
+        issues = []
+
+        # Cek kata asing yang seharusnya italic
+        # (Deteksi sederhana untuk kata yang bukan dalam kamus umum)
+        words = re.findall(r'\b[a-zA-Z]+\b', text)
+        common_words = set(['the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i',
+                           'it', 'for', 'not', 'on', 'with', 'he', 'as', 'you', 'do', 'at'])
+
+        for word in words:
+            if word.lower() not in common_words and len(word) > 3:
+                issues.append({
+                    'word': word,
+                    'issue': 'Kata asing/tidak umum yang mungkin perlu dicetak miring',
+                    'suggestion': f"*{word}*"
+                })
+
+        return issues
+
+    def check_coherence(self, text):
+        """
+        Memeriksa koherensi kata dan kalimat
+        """
+        issues = []
+        sentences = nltk.sent_tokenize(text)
+
+        if len(sentences) > 1:
+            # Cek transisi antar kalimat
+            transitions = ['first', 'second', 'third', 'finally', 'however', 'therefore',
+                          'moreover', 'furthermore', 'consequently', 'additionally']
+
+            for i in range(1, len(sentences)):
+                prev_words = set(sentences[i-1].lower().split())
+                curr_words = set(sentences[i].lower().split())
+
+                # Cek apakah ada kata penghubung
+                has_transition = any(trans in curr_words for trans in transitions)
+
+                # Cek overlap antar kalimat
+                overlap = len(prev_words.intersection(curr_words)) / len(prev_words)
+
+                if overlap < 0.1 and not has_transition:
+                    issues.append({
+                        'sentence': sentences[i][:100] + '...',
+                        'issue': 'Kalimat mungkin tidak koheren',
+                        'suggestion': 'Tambahkan kata transisi atau perbaiki struktur kalimat'
+                    })
+
+        return issues
+
+    def check_eyd(self, text):
+        """
+        Memeriksa standar EYD (Ejaan Yang Disempurnakan) untuk Bahasa Indonesia
+        """
+        issues = []
+
+        # Aturan EYD sederhana
+        rules = [
+            # Penggunaan huruf kapital
+            (r'(?<=\. )([a-z])', 'Huruf kapital setelah titik'),
+            # Penggunaan tanda baca
+            (r'(,)([A-Za-z])', 'Spasi setelah tanda koma'),
+            (r'(\.)([A-Za-z])', 'Spasi setelah tanda titik'),
+            # Preposisi di, ke, dari
+            (r'\b(di|ke|dari)([A-Z]|[a-z])', 'Penulisan preposisi yang salah'),
+        ]
+
+        for pattern, message in rules:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                issues.append({
+                    'issue': message,
+                    'context': text[max(0, match.start()-20):min(len(text), match.end()+20)],
+                    'suggestion': 'Perbaiki sesuai aturan EYD'
+                })
+
+        return issues
+
+# ============================================
+# 3. FUNGSI DETEKSI SIMILARITY DAN PARAPHRASE
+# ============================================
+
+class SimilarityDetector:
+    def __init__(self):
+        """
+        Inisialisasi model untuk deteksi similarity dan parafrase
+        """
+        print("🔧 Menginisialisasi model similarity...")
+        self.sentence_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        self.paraphraser = pipeline("text2text-generation", model="t5-small")
+        print("✅ Model similarity siap digunakan")
+
+    def check_similarity(self, text, threshold=0.7):
+        """
+        Mendeteksi kalimat yang memiliki similarity tinggi
+        """
+        sentences = nltk.sent_tokenize(text)
+        similar_pairs = []
+
+        if len(sentences) > 1:
+            embeddings = self.sentence_model.encode(sentences, convert_to_tensor=True)
+
+            for i in range(len(sentences)):
+                for j in range(i+1, len(sentences)):
+                    similarity = util.pytorch_cos_sim(embeddings[i], embeddings[j])
+                    if similarity > threshold:
+                        similar_pairs.append({
+                            'sentence1': sentences[i],
+                            'sentence2': sentences[j],
+                            'similarity_score': float(similarity)
+                        })
+
+        return similar_pairs
+
+    def paraphrase_text(self, text):
+        """
+        Membuat parafrase dari teks yang mirip
+        """
+        try:
+            # Batasi panjang teks
+            if len(text) > 200:
+                text = text[:200]
+
+            # Generate parafrase
+            paraphrase = self.paraphraser(
+                f"paraphrase: {text}",
+                max_length=200,
+                num_return_sequences=1
+            )
+
+            return paraphrase[0]['generated_text']
+        except Exception as e:
+            print(f"❌ Error parafrase: {e}")
+            return text
+
+# ============================================
+# 4. FUNGSI DETEKSI PENGGUNAAN AI
+# ============================================
+
+class AIDetector:
+    def __init__(self):
+        """
+        Inisialisasi model untuk deteksi teks yang dihasilkan AI
+        """
+        print("🔧 Menginisialisasi model deteksi AI...")
+        self.ai_detector = pipeline(
+            "text-classification",
+            model="roberta-base-openai-detector"
+        )
+        print("✅ Model deteksi AI siap digunakan")
+
+    def detect_ai_usage(self, text):
+        """
+        Mendeteksi persentase teks yang mungkin dihasilkan AI
+        """
+        try:
+            # Bagi teks menjadi beberapa bagian
+            chunks = [text[i:i+512] for i in range(0, min(len(text), 10000), 512)]
+            ai_scores = []
+
+            for chunk in chunks:
+                if len(chunk) > 50:
+                    result = self.ai_detector(chunk[:512])
+                    if result:
+                        ai_scores.append(result[0]['score'] if result[0]['label'] == 'LABEL_1' else 1 - result[0]['score'])
+
+            if ai_scores:
+                avg_ai_score = np.mean(ai_scores)
+                return {
+                    'ai_percentage': avg_ai_score * 100,
+                    'classification': 'High AI Usage' if avg_ai_score > 0.7 else 'Medium AI Usage' if avg_ai_score > 0.4 else 'Low AI Usage',
+                    'confidence': avg_ai_score
+                }
+
+            return None
+        except Exception as e:
+            print(f"❌ Error deteksi AI: {e}")
+            return None
+
+# ============================================
+# 5. FUNGSI ANALISIS LANJUTAN
+# ============================================
+
+def analyze_statistics(text):
+    """
+    Analisis statistik teks
+    """
+    stats = {
+        'total_words': len(text.split()),
+        'total_characters': len(text),
+        'total_sentences': len(nltk.sent_tokenize(text)),
+        'avg_word_length': np.mean([len(word) for word in text.split()]),
+        'unique_words': len(set(text.split())),
+    }
+
+    # Hitung tingkat keragaman kosakata
+    if stats['total_words'] > 0:
+        stats['vocabulary_diversity'] = stats['unique_words'] / stats['total_words']
+    else:
+        stats['vocabulary_diversity'] = 0
+
+    return stats
+
+def generate_report(original_text, corrected_text, corrections, issues, stats, ai_analysis, similar_pairs):
+    """
+    Generate laporan lengkap dalam format DOCX
+    """
+    from docx import Document
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+
+    # Judul
+    title = doc.add_heading('LAPORAN ANALISIS PAPER', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Ringkasan
+    doc.add_heading('Ringkasan Analisis', level=1)
+    doc.add_paragraph(f'Total Kata: {stats["total_words"]}')
+    doc.add_paragraph(f'Total Kalimat: {stats["total_sentences"]}')
+    doc.add_paragraph(f'Kata Unik: {stats["unique_words"]}')
+    doc.add_paragraph(f'Keragaman Kosakata: {stats["vocabulary_diversity"]:.3f}')
+    doc.add_paragraph(f'Rata-rata Panjang Kata: {stats["avg_word_length"]:.2f}')
+
+    # Analisis AI
+    if ai_analysis:
+        doc.add_heading('Analisis Penggunaan AI', level=1)
+        doc.add_paragraph(f'Persentase Penggunaan AI: {ai_analysis["ai_percentage"]:.2f}%')
+        doc.add_paragraph(f'Klasifikasi: {ai_analysis["classification"]}')
+
+    # Koreksi kesalahan
+    doc.add_heading('Koreksi Kesalahan', level=1)
+
+    if corrections:
+        table = doc.add_table(rows=len(corrections)+1, cols=3)
+        table.style = 'Light Grid Accent 1'
+
+        # Header
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Jenis Kesalahan'
+        hdr_cells[1].text = 'Sebelum'
+        hdr_cells[2].text = 'Sesudah'
+
+        for i, corr in enumerate(corrections, 1):
+            row_cells = table.rows[i].cells
+            row_cells[0].text = 'Typo/Grammar'
+            row_cells[1].text = corr.get('original', '')
+            row_cells[2].text = corr.get('corrected', '')
+
+    # Isu Formatting
+    if issues:
+        doc.add_heading('Isu Formatting dan Gaya Penulisan', level=1)
+        for issue in issues[:10]:  # Batasi 10 issue teratas
+            doc.add_paragraph(
+                f"• {issue.get('issue', '')}",
+                style='List Bullet'
+            )
+            if 'suggestion' in issue:
+                doc.add_paragraph(
+                    f"  Saran: {issue['suggestion']}",
+                    style='List Bullet'
+                )
+
+    # Similarity
+    if similar_pairs:
+        doc.add_heading('Analisis Similaritas', level=1)
+        doc.add_paragraph(f'Total pasangan kalimat serupa: {len(similar_pairs)}')
+
+        for pair in similar_pairs[:5]:  # Tampilkan 5 pasangan pertama
+            doc.add_paragraph(f'Skor Similaritas: {pair["similarity_score"]:.2f}')
+            doc.add_paragraph(f'Kalimat 1: {pair["sentence1"][:100]}...')
+            doc.add_paragraph(f'Kalimat 2: {pair["sentence2"][:100]}...')
+            doc.add_paragraph('')
+
+    # Teks yang sudah dikoreksi
+    doc.add_heading('Hasil Koreksi', level=1)
+    doc.add_paragraph('Teks yang telah dikoreksi:')
+    doc.add_paragraph(corrected_text)
+
+    # Simpan
+    output_file = 'hasil_koreksi_paper.docx'
+    doc.save(output_file)
+    return output_file
+
+# ============================================
+# 6. FUNGSI UTAMA
+# ============================================
+
+def main():
+    """
+    Fungsi utama program
+    """
+    print("="*80)
+    print("📚 PROGRAM ANALISIS DAN KOREKSI OTOMATIS PAPER")
+    print("="*80)
+
+    print("\nFitur:")
+    print("✅ Deteksi dan koreksi typo")
+    print("✅ Deteksi dan koreksi grammar")
+    print("✅ Deteksi dan koreksi EYD")
+    print("✅ Deteksi format penulisan")
+    print("✅ Analisis koherensi teks")
+    print("✅ Deteksi similarity dan parafrase")
+    print("✅ Analisis penggunaan AI")
+    print("✅ Analisis statistik teks")
+    print("="*80)
+
+    # Upload file
+    file_path = upload_file()
+    if not file_path:
+        print("❌ Tidak ada file yang diupload")
+        return
+
+    # Baca file
+    print("\n📖 Membaca file...")
+    original_text = read_file(file_path)
+
+    if not original_text:
+        print("❌ Gagal membaca file")
+        return
+
+    print(f"✅ Teks berhasil dibaca. Total karakter: {len(original_text)}")
+
+    # Inisialisasi tools
+    corrector = TextCorrector()
+    similarity = SimilarityDetector()
+    ai_detector = AIDetector()
+
+    # Analisis statistik
+    print("\n📊 Analisis statistik teks...")
+    stats = analyze_statistics(original_text)
+
+    # Deteksi typo
+    print("\n🔍 Memeriksa typo...")
+    text_typo, typo_fixes = corrector.check_typos(original_text)
+
+    # Deteksi grammar
+    print("\n📝 Memeriksa grammar...")
+    text_grammar, grammar_fixes = corrector.check_grammar(text_typo)
+
+    # Deteksi EYD
+    print("\n📝 Memeriksa EYD...")
+    eyd_issues = corrector.check_eyd(text_grammar)
+
+    # Deteksi formatting
+    print("\n📝 Memeriksa formatting...")
+    format_issues = corrector.check_formatting(text_grammar)
+
+    # Deteksi koherensi
+    print("\n📝 Memeriksa koherensi...")
+    coherence_issues = corrector.check_coherence(text_grammar)
+
+    # Gabungkan semua isu
+    all_issues = typo_fixes + grammar_fixes + eyd_issues + format_issues + coherence_issues
+
+    # Deteksi similarity
+    print("\n🔍 Mendeteksi similarity...")
+    similar_pairs = similarity.check_similarity(text_grammar)
+
+    # Parafrase kalimat yang mirip
+    paraphrased_text = text_grammar
+    if similar_pairs:
+        print("\n🔄 Melakukan parafrase...")
+        for pair in similar_pairs[:5]:  # Parafrase 5 pasangan pertama
+            if pair['similarity_score'] > 0.8:
+                paraphrased = similarity.paraphrase_text(pair['sentence1'])
+                if paraphrased:
+                    paraphrased_text = paraphrased_text.replace(pair['sentence1'], paraphrased)
+
+    # Deteksi AI
+    print("\n🤖 Menganalisis penggunaan AI...")
+    ai_analysis = ai_detector.detect_ai_usage(original_text)
+
+    # Generate report
+    print("\n📄 Membuat laporan...")
+    output_file = generate_report(
+        original_text,
+        paraphrased_text,
+        all_issues,
+        all_issues,
+        stats,
+        ai_analysis,
+        similar_pairs
+    )
+
+    print(f"\n✅ Laporan berhasil dibuat: {output_file}")
+    print("📥 Download file laporan...")
+    files.download(output_file)
+
+    # Tampilkan ringkasan di console
+    print("\n" + "="*80)
+    print("📊 RINGKASAN ANALISIS")
+    print("="*80)
+    print(f"Total Kata: {stats['total_words']}")
+    print(f"Total Kalimat: {stats['total_sentences']}")
+    print(f"Kata Unik: {stats['unique_words']}")
+    print(f"Keragaman Kosakata: {stats['vocabulary_diversity']:.3f}")
+    print(f"Jumlah Kesalahan Terdeteksi: {len(all_issues)}")
+    print(f"Jumlah Pasangan Similar: {len(similar_pairs)}")
+
+    if ai_analysis:
+        print(f"\n🤖 Analisis AI:")
+        print(f"  Persentase AI: {ai_analysis['ai_percentage']:.2f}%")
+        print(f"  Klasifikasi: {ai_analysis['classification']}")
+
+    print("\n" + "="*80)
+    print("✅ PROSES SELESAI!")
+    print("="*80)
+
+# ============================================
+# 7. EKSEKUSI PROGRAM
+# ============================================
+
+if __name__ == "__main__":
+    main()
